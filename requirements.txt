@@ -1,0 +1,6 @@
+smbus
+board
+adafruit_dht
+psutil
+psycopg2
+paho-mqtt
