@@ -100,7 +100,7 @@ if __name__ == "__main__":
 
     # Give time on startup for the db + mqtt broker to come alive
     print("sleeping for 60 seconds to ensure postgres and mqtt broker is alive")
-    time.sleep(10)
+    time.sleep(60)
 
     # connect to db + mqtt
     client = connect_mqtt()
