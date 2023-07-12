@@ -10,12 +10,7 @@ import adafruit_dht
 import psutil
 import RPi.GPIO as GPIO
 
-
-#GPIO SETUP
-channel = 17
-GPIO.setmode(GPIO.BCM)
-GPIO.setup(channel, GPIO.IN)
-count = 0
+#sound_history = []
 
 # mqtt vars
 Connected = False   #global variable for the state of the connection
@@ -25,9 +20,29 @@ temp_topic = "python/temp"
 pressure_topic = "python/pressure"
 humidity_topic = "python/humidity"
 sound_topic = "python/sound"
+#sound_count = 0
+
+class Sensors:
+    def __init__(self, temp, pressure, humidity):
+        self.temp = temp
+        self.pressure = pressure
+        self.humidity = humidity
+        self.sound_count = 0
+        self.sound_history = []
+
+    
+    # calculates the average of the values in sound_history
+    def sound_average(self):
+        if len(self.sound_history) == 0:
+            return 99
+        s = 0
+        for i in self.sound_history:
+            s += i
+        return s/len(self.sound_history)
+
+
 
 def on_connect(client, userdata, flags, rc):
- 
     if rc == 0:
         #print("Connected to broker")
         global Connected
@@ -46,79 +61,102 @@ def connect_mqtt():
         time.sleep(0.1)
     return client
 
-def kill_libgpiod():
-    for proc in psutil.process_iter():
-        if proc.name() == 'libgpiod_pulsein' or proc.name() == 'libgpiod_pulsei':
-            proc.kill()
-
 def get_humidity(humidity_sensor):
-    #while True:
     try:
         humidity = humidity_sensor.humidity
         print("humidity: {}".format(humidity))
         return humidity
     except RuntimeError as error:
         print(error.args[0])
+        time.sleep(2)
+        return None
 
-def sound_callback(channel):
-    global count
-    count += 1
-    sleep(0.1)
+# a callback function for the sound sensor to increment the global count var
+def sound_callback(channel, sensors):
+    sensors.sound_count += 1
+    time.sleep(0.05)
 
-GPIO.add_event_detect(channel, GPIO.BOTH, bouncetime=300)  # let us know when the pin goes HIGH or LOW
-GPIO.add_event_callback(channel, sound_callback)  # assign function to GPIO PIN, Run function on change
+def setup_sensors():
+
+    temp_sensor = DS18B20()
+    pressure_sensor = smbus.SMBus(1)
+    humidity_sensor = adafruit_dht.DHT11(board.D23, use_pulseio=False)
+
+    sensors = Sensors(temp_sensor, pressure_sensor, humidity_sensor)
+    
+    # sound sensor setup (pin 17)
+    channel = 17
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setup(channel, GPIO.IN)
+    
+    # sound sensor callbacks
+    GPIO.add_event_detect(channel, GPIO.BOTH, bouncetime=300)  # let us know when the pin goes HIGH or LOW
+    GPIO.add_event_callback(channel, callback=lambda channel: sound_callback(channel, sensors))  # assign function to GPIO PIN, Run function on change
+
+    return sensors
+
 
 if __name__ == "__main__":
 
     # Give time on startup for the db + mqtt broker to come alive
     print("sleeping for 60 seconds to ensure postgres and mqtt broker is alive")
-    time.sleep(60)
+    time.sleep(10)
+
     # connect to db + mqtt
     client = connect_mqtt()
     conn = psycopg2.connect("dbname=postgres user=postgres password=postgres")
     cur = conn.cursor()
 
-    temp_sensor = DS18B20()
-    pressure_sensor = smbus.SMBus(1)
-    humidity_sensor = adafruit_dht.DHT11(board.D23)
-    
+    # setup sensors
+    sensors = setup_sensors()
+
     try:
         while True:
-            try:
 
-                temp = temp_sensor.read_temp()
-                pressure = get_pressure(pressure_sensor)
-                humidity = get_humidity(humidity_sensor)
-            
-                t = time.localtime()
+            # read sensor values
+            temp = sensors.temp.read_temp()
+            pressure = get_pressure(sensors.pressure)
+            humidity = get_humidity(sensors.humidity)
+ 
+            t = time.localtime()
         
-                cur.execute("INSERT INTO weather.temperature (timestamp, value) VALUES (%s, %s)", (time.strftime("%Y-%m-%d %H:%M:%S"), temp))
-                cur.execute("INSERT INTO weather.pressure (timestamp, value) VALUES (%s, %s)", (time.strftime("%Y-%m-%d %H:%M:%S"), pressure))
-               
-                cur.execute("INSERT INTO weather.sound (timestamp, value) VALUES (%s, %s)", (time.strftime("%Y-%m-%d %H:%M:%S"), count))
+            # insert temp, pressure and sound count into db
+            cur.execute("INSERT INTO weather.temperature (timestamp, value) VALUES (%s, %s)", (time.strftime("%Y-%m-%d %H:%M:%S"), temp))
+            cur.execute("INSERT INTO weather.pressure (timestamp, value) VALUES (%s, %s)", (time.strftime("%Y-%m-%d %H:%M:%S"), pressure))
+            cur.execute("INSERT INTO weather.sound (timestamp, value) VALUES (%s, %s)", (time.strftime("%Y-%m-%d %H:%M:%S"), sensors.sound_count))
+            
+            # publish the temp and pressure values to mqtt 
+            client.publish(temp_topic, temp)
+            client.publish(pressure_topic, pressure)
 
-                print("temp: {}".format(temp))             
-                print("pressure: {}".format(pressure))
-                print("sound count: {}".format(count))
+            # sometimes the sound sensor records incorrectly high measurements
+            # we only log to mqtt if the value was less than 3 times the average 
+            # of the past 5 measurements
+            if sensors.sound_count < (sensors.sound_average()) * 3:
+                client.publish(sound_topic, sensors.sound_count)
+                print("sound count: {}".format(sensors.sound_count))
 
-                client.publish(temp_topic, temp)
-                client.publish(pressure_topic, pressure)
-                client.publish(sound_topic, count)
+                sensors.sound_history.append(sensors.sound_count)
+                if len(sensors.sound_history) > 5:
+                    sensors.sound_history.pop(0)
 
-                if humidity != None:
-                     
-                    cur.execute("INSERT INTO weather.humidity (timestamp, value) VALUES (%s, %s)", (time.strftime("%Y-%m-%d %H:%M:%S"), humidity))
+            else:
+                print("sound was too high")
+                print("sound: {}, average: {}".format(sensors.sound_count, sensors.sound_average()))
+
+            print("temp: {}".format(temp))             
+            print("pressure: {}".format(pressure))
+
+
+            # the humidity sensor is flakey, check there's a value before sending data
+            if humidity != None:
+                cur.execute("INSERT INTO weather.humidity (timestamp, value) VALUES (%s, %s)", (time.strftime("%Y-%m-%d %H:%M:%S"), humidity))
+                client.publish(humidity_topic, humidity)
                 
-                    client.publish(humidity_topic, humidity)
-                
-                conn.commit()
-                count = 0
-                
-                time.sleep(60)
-            except RuntimeError as error:
-                print(error.args[0])
-                time.sleep(5)
-                continue
+            conn.commit()
+            sensors.sound_count = 0
+
+            time.sleep(60)
   
     except KeyboardInterupt:
         client.disconnect()
