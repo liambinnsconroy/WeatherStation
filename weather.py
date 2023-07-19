@@ -6,7 +6,7 @@ from ds18b20 import DS18B20
 from spl06 import get_pressure
 import smbus
 import board
-import adafruit_dht
+import dht11
 import psutil
 import RPi.GPIO as GPIO
 
@@ -20,7 +20,6 @@ temp_topic = "python/temp"
 pressure_topic = "python/pressure"
 humidity_topic = "python/humidity"
 sound_topic = "python/sound"
-#sound_count = 0
 
 class Sensors:
     def __init__(self, temp, pressure, humidity):
@@ -28,7 +27,7 @@ class Sensors:
         self.pressure = pressure
         self.humidity = humidity
         self.sound_count = 0
-        self.sound_history = []
+        self.sound_history = [99,99,99,99,99]
 
     
     # calculates the average of the values in sound_history
@@ -62,14 +61,25 @@ def connect_mqtt():
     return client
 
 def get_humidity(humidity_sensor):
-    try:
-        humidity = humidity_sensor.humidity
-        print("humidity: {}".format(humidity))
-        return humidity
-    except RuntimeError as error:
-        print(error.args[0])
-        time.sleep(2)
-        return None
+
+    # The humidity sensor is a bit flakey, retry up to 3 times
+    count = 0
+    while True:
+        if count < 3:
+            count +=1
+
+            readings = humidity_sensor.read()
+
+            if readings.is_valid():
+                print("humidity: {}".format(readings.humidity))
+                return readings.humidity
+            else:
+                print("humidity result was bad, trying again")
+                time.sleep(0.2)
+
+        else:
+            break
+    return None
 
 # a callback function for the sound sensor to increment the global count var
 def sound_callback(channel, sensors):
@@ -80,7 +90,7 @@ def setup_sensors():
 
     temp_sensor = DS18B20()
     pressure_sensor = smbus.SMBus(1)
-    humidity_sensor = adafruit_dht.DHT11(board.D23, use_pulseio=False)
+    humidity_sensor = dht11.DHT11(pin=23)
 
     sensors = Sensors(temp_sensor, pressure_sensor, humidity_sensor)
     
@@ -110,58 +120,54 @@ if __name__ == "__main__":
     # setup sensors
     sensors = setup_sensors()
 
-    try:
-        while True:
 
-            # read sensor values
-            temp = sensors.temp.read_temp()
-            pressure = get_pressure(sensors.pressure)
-            humidity = get_humidity(sensors.humidity)
+    while True:
+
+        # read sensor values
+        temp = sensors.temp.read_temp()
+        pressure = get_pressure(sensors.pressure)
+        humidity = get_humidity(sensors.humidity)
  
-            t = time.localtime()
+        t = time.localtime()
         
-            # insert temp, pressure and sound count into db
-            cur.execute("INSERT INTO weather.temperature (timestamp, value) VALUES (%s, %s)", (time.strftime("%Y-%m-%d %H:%M:%S"), temp))
-            cur.execute("INSERT INTO weather.pressure (timestamp, value) VALUES (%s, %s)", (time.strftime("%Y-%m-%d %H:%M:%S"), pressure))
-            cur.execute("INSERT INTO weather.sound (timestamp, value) VALUES (%s, %s)", (time.strftime("%Y-%m-%d %H:%M:%S"), sensors.sound_count))
+        # insert temp, pressure and sound count into db
+        cur.execute("INSERT INTO weather.temperature (timestamp, value) VALUES (%s, %s)", (time.strftime("%Y-%m-%d %H:%M:%S"), temp))
+        cur.execute("INSERT INTO weather.pressure (timestamp, value) VALUES (%s, %s)", (time.strftime("%Y-%m-%d %H:%M:%S"), pressure))
+        cur.execute("INSERT INTO weather.sound (timestamp, value) VALUES (%s, %s)", (time.strftime("%Y-%m-%d %H:%M:%S"), sensors.sound_count))
             
-            # publish the temp and pressure values to mqtt 
-            client.publish(temp_topic, temp)
-            client.publish(pressure_topic, pressure)
+        # publish the temp and pressure values to mqtt 
+        client.publish(temp_topic, temp)
+        client.publish(pressure_topic, pressure)
 
-            # sometimes the sound sensor records incorrectly high measurements
-            # we only log to mqtt if the value was less than 3 times the average 
-            # of the past 5 measurements
-            if sensors.sound_count < (sensors.sound_average()) * 3:
-                client.publish(sound_topic, sensors.sound_count)
-                print("sound count: {}".format(sensors.sound_count))
+        # sometimes the sound sensor records incorrectly high measurements
+        # we only log to mqtt if the value was less than 3 times the average 
+        # of the past 5 measurements
+        if sensors.sound_count < (sensors.sound_average()) * 3:
+            client.publish(sound_topic, sensors.sound_count)
+            print("sound count: {}".format(sensors.sound_count))
 
-                sensors.sound_history.append(sensors.sound_count)
-                if len(sensors.sound_history) > 5:
-                    sensors.sound_history.pop(0)
+            sensors.sound_history.append(sensors.sound_count)
+            if len(sensors.sound_history) > 5:
+                sensors.sound_history.pop(0)
 
-            else:
-                print("sound was too high")
-                print("sound: {}, average: {}".format(sensors.sound_count, sensors.sound_average()))
+        else:
+            print("sound was too high")
+            print("sound: {}, average: {}".format(sensors.sound_count, sensors.sound_average()))
 
-            print("temp: {}".format(temp))             
-            print("pressure: {}".format(pressure))
+        print("temp: {}".format(temp))             
+        print("pressure: {}".format(pressure))
 
 
-            # the humidity sensor is flakey, check there's a value before sending data
-            if humidity != None:
-                cur.execute("INSERT INTO weather.humidity (timestamp, value) VALUES (%s, %s)", (time.strftime("%Y-%m-%d %H:%M:%S"), humidity))
-                client.publish(humidity_topic, humidity)
+        # the humidity sensor is flakey, check there's a value before sending data
+        if humidity != None:
+            cur.execute("INSERT INTO weather.humidity (timestamp, value) VALUES (%s, %s)", (time.strftime("%Y-%m-%d %H:%M:%S"), humidity))
+            client.publish(humidity_topic, humidity)
                 
-            conn.commit()
-            sensors.sound_count = 0
+        conn.commit()
+        sensors.sound_count = 0
 
-            time.sleep(60)
+        time.sleep(60)
   
-    except KeyboardInterupt:
-        client.disconnect()
-        client.loop_stop()
-
         # close the file and the db connection    
         cur.close()
         conn.close()
