@@ -169,5 +169,5 @@ if __name__ == "__main__":
         time.sleep(60)
   
         # close the file and the db connection    
-        cur.close()
-        conn.close()
+    cur.close()
+    conn.close()
