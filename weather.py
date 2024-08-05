@@ -14,7 +14,7 @@ import RPi.GPIO as GPIO
 
 # mqtt vars
 Connected = False   #global variable for the state of the connection
-broker_address= "192.168.68.54"
+broker_address= "192.168.68.73"
 port = 1883
 temp_topic = "python/temp"
 pressure_topic = "python/pressure"
